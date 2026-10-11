@@ -25,6 +25,18 @@ class Scan(Base):
         default="pending",
     )
 
+    profile: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="common",
+    )
+
+    vulnerability_profile: Mapped[str] = mapped_column(
+    String(20),
+    nullable=False,
+    default="lightweight",
+    )
+
     started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,

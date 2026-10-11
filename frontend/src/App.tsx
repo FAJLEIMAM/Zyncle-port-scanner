@@ -1,119 +1,270 @@
-import { useState } from 'react'
+﻿import { useCallback, useEffect, useRef, useState } from 'react'
+
 import './App.css'
 
-const API_BASE_URL = 'http://127.0.0.1:8001'
+import {
+  POLL_INTERVAL_MS,
+  createScan,
+  getScan,
+  getScanHistory,
+} from './api'
+import Sidebar from './components/Sidebar'
+import Topbar from './components/Topbar'
+import AssetsPage from './pages/AssetsPage'
+import CurrentScanPage from './pages/CurrentScanPage'
+import DashboardPage from './pages/DashboardPage'
+import HistoryPage from './pages/HistoryPage'
+import NewScanPage from './pages/NewScanPage'
+import SettingsPage from './pages/SettingsPage'
+import VulnerabilitiesPage from './pages/VulnerabilitiesPage'
+import type {
+  ActiveSection,
+  ApiState,
+  ScanCreateResponse,
+  ScanHistoryItem,
+  ScanProfile,
+  ScanResult,
+  VulnerabilityProfile,
+} from './types'
+import { sleep } from './utils'
 
-type Finding = {
-  id: number
-  title: string
-  description: string | null
-  severity: string | null
-  matcher_name: string | null
-  cvss_score: number | null
-  cwe_ids: string | null
-  cvss_metrics: string | null
-  risk_level: string | null
-  risk_reason: string | null
-  source: string
-  vulnerability_id: string | null
-  evidence: string | null
-}
-
-type Service = {
-  service_name: string | null
-  product: string | null
-  version: string | null
-  cpe: string | null
-  confidence?: number | null
-  banner?: string | null
-}
-
-type Port = {
-  id: number
-  port_number: number
-  protocol: string
-  state: string
-  service: Service | null
-  findings: Finding[]
-}
-
-type Host = {
-  id: number
-  address: string
-  hostname: string | null
-  status: string
-  ports: Port[]
-}
-
-type ScanResult = {
-  id: number
-  target: string
-  status: string
-  started_at: string | null
-  completed_at: string | null
-  error_message: string | null
-  hosts: Host[]
-}
-
-type ScanCreateResponse = {
-  id: number
-  target: string
-  status: string
-  started_at: string | null
-  completed_at: string | null
+const PAGE_TITLES: Record<
+  ActiveSection,
+  { title: string; subtitle: string }
+> = {
+  dashboard: {
+    title: 'Dashboard',
+    subtitle: 'Security posture across your recent scans',
+  },
+  'new-scan': {
+    title: 'New Scan',
+    subtitle: 'Configure the target and scanning profiles',
+  },
+  'current-scan': {
+    title: 'Current Scan',
+    subtitle: 'Live status and detailed results',
+  },
+  history: {
+    title: 'Scan History',
+    subtitle: 'Review and open previous scan results',
+  },
+  vulnerabilities: {
+    title: 'Vulnerabilities',
+    subtitle: 'Findings from the selected scan',
+  },
+  assets: {
+    title: 'Assets',
+    subtitle: 'Hosts, ports and services from the selected scan',
+  },
+  settings: {
+    title: 'Settings',
+    subtitle: 'Connection and scanner configuration',
+  },
 }
 
 function App() {
   const [target, setTarget] = useState('http://127.0.0.1:3000')
+
+  const [profile, setProfile] = useState<ScanProfile>('common')
+
+  const [vulnerabilityProfile, setVulnerabilityProfile] =
+    useState<VulnerabilityProfile>('lightweight')
+
   const [scanId, setScanId] = useState<number | null>(null)
+
+  const [scanMeta, setScanMeta] =
+    useState<ScanCreateResponse | null>(null)
+
   const [result, setResult] = useState<ScanResult | null>(null)
+
   const [loading, setLoading] = useState(false)
+
   const [scanStatus, setScanStatus] = useState('')
+
   const [error, setError] = useState('')
 
-  const sleep = (ms: number) =>
-    new Promise((resolve) => setTimeout(resolve, ms))
+  const [scanHistory, setScanHistory] = useState<ScanHistoryItem[]>([])
 
-  const getScan = async (id: number): Promise<ScanResult> => {
-    const response = await fetch(
-      `${API_BASE_URL}/api/scans/${id}`,
-    )
+  const [historyLoading, setHistoryLoading] = useState(true)
 
-    if (!response.ok) {
-      throw new Error(
-        `Failed to retrieve scan results (${response.status})`,
+  const [historyError, setHistoryError] = useState('')
+
+  const [apiState, setApiState] = useState<ApiState>('checking')
+
+  // Most recent completed scan (full detail) for the dashboard,
+  // vulnerabilities and assets views.
+  const [latestScan, setLatestScan] = useState<ScanResult | null>(null)
+
+  const [latestLoading, setLatestLoading] = useState(false)
+
+  const [latestError, setLatestError] = useState('')
+
+  const latestScanIdRef = useRef<number | null>(null)
+
+  const [activeSection, setActiveSection] =
+    useState<ActiveSection>('dashboard')
+
+  const mainRef = useRef<HTMLElement | null>(null)
+
+  const firstRender = useRef(true)
+
+  // ==========================================================
+  // LATEST COMPLETED SCAN (detail)
+  // ==========================================================
+
+  const loadLatestScan = useCallback(
+    async (history: ScanHistoryItem[]) => {
+      const latestCompleted = history.find(
+        (scan) => scan.status === 'completed',
       )
+
+      if (!latestCompleted) {
+        latestScanIdRef.current = null
+        setLatestScan(null)
+        setLatestError('')
+        return
+      }
+
+      // Completed scans do not change; skip the request.
+      if (latestScanIdRef.current === latestCompleted.id) {
+        return
+      }
+
+      setLatestLoading(true)
+      setLatestError('')
+
+      try {
+        const scan = await getScan(latestCompleted.id)
+
+        latestScanIdRef.current = scan.id
+        setLatestScan(scan)
+      } catch (err) {
+        setLatestError(
+          err instanceof Error
+            ? err.message
+            : 'Unable to load latest scan',
+        )
+      } finally {
+        setLatestLoading(false)
+      }
+    },
+    [],
+  )
+
+  // ==========================================================
+  // GET SCAN HISTORY
+  // ==========================================================
+
+  const loadScanHistory = useCallback(async () => {
+    setHistoryLoading(true)
+
+    try {
+      const data = await getScanHistory()
+
+      setScanHistory(data)
+      setHistoryError('')
+      setApiState('online')
+
+      await loadLatestScan(data)
+    } catch (err) {
+      console.error('Scan history error:', err)
+
+      setHistoryError(
+        err instanceof Error
+          ? err.message
+          : 'Unable to load scan history',
+      )
+
+      setApiState('offline')
+    } finally {
+      setHistoryLoading(false)
+    }
+  }, [loadLatestScan])
+
+  useEffect(() => {
+    void loadScanHistory()
+  }, [loadScanHistory])
+
+  // Move keyboard focus to the content area when the page changes.
+  useEffect(() => {
+    if (firstRender.current) {
+      firstRender.current = false
+      return
     }
 
-    return response.json()
+    mainRef.current?.focus()
+  }, [activeSection])
+
+  // ==========================================================
+  // VIEW HISTORICAL SCAN
+  // ==========================================================
+
+  const handleViewScan = async (id: number) => {
+    try {
+      setError('')
+      setLoading(true)
+      setScanStatus('loading')
+
+      const scan = await getScan(id)
+
+      setScanId(scan.id)
+      setScanMeta(null)
+      setScanStatus(scan.status)
+      setProfile(scan.profile)
+      setVulnerabilityProfile(scan.vulnerability_profile)
+      setResult(scan)
+
+      setActiveSection('current-scan')
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : 'Unable to load scan',
+      )
+
+      setActiveSection('current-scan')
+    } finally {
+      setLoading(false)
+    }
   }
 
-  const waitForScan = async (id: number) => {
-    const maxAttempts = 240
+  // ==========================================================
+  // POLL ACTIVE SCAN
+  // ==========================================================
 
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+  const waitForScan = async (id: number) => {
+    while (true) {
       const scan = await getScan(id)
 
       setScanStatus(scan.status)
 
       if (scan.status === 'completed') {
         setResult(scan)
+        setProfile(scan.profile)
+        setVulnerabilityProfile(scan.vulnerability_profile)
+
+        latestScanIdRef.current = scan.id
+        setLatestScan(scan)
+        setLatestError('')
+
+        await loadScanHistory()
+
         return
       }
 
       if (scan.status === 'failed') {
+        await loadScanHistory()
+
         throw new Error(
           scan.error_message || 'Scan failed on the backend',
         )
       }
 
-      await sleep(2000)
+      await sleep(POLL_INTERVAL_MS)
     }
-
-    throw new Error(
-      'Scan is taking longer than expected. Check the backend status.',
-    )
   }
+
+  // ==========================================================
+  // START NEW SCAN
+  // ==========================================================
 
   const handleStartScan = async () => {
     const cleanTarget = target.trim()
@@ -123,451 +274,174 @@ function App() {
       return
     }
 
+    if (loading) {
+      return
+    }
+
     setLoading(true)
     setError('')
     setResult(null)
     setScanId(null)
+    setScanMeta(null)
     setScanStatus('starting')
+    setActiveSection('current-scan')
 
     try {
-      const response = await fetch(
-        `${API_BASE_URL}/api/scans`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            target: cleanTarget,
-          }),
-        },
-      )
-
-      if (!response.ok) {
-        let message = `Failed to start scan (${response.status})`
-
-        try {
-          const data = await response.json()
-
-          if (typeof data.detail === 'string') {
-            message = data.detail
-          }
-        } catch {
-          // Keep the default error message.
-        }
-
-        throw new Error(message)
-      }
-
-      const data: ScanCreateResponse = await response.json()
+      const data = await createScan({
+        target: cleanTarget,
+        profile,
+        vulnerability_profile: vulnerabilityProfile,
+      })
 
       setScanId(data.id)
+      setScanMeta(data)
       setScanStatus(data.status)
+      setProfile(data.profile)
+      setVulnerabilityProfile(data.vulnerability_profile)
+
+      await loadScanHistory()
 
       await waitForScan(data.id)
     } catch (err) {
       setError(
-        err instanceof Error
-          ? err.message
-          : 'Unable to start scan',
+        err instanceof Error ? err.message : 'Unable to start scan',
       )
+
       setScanStatus('failed')
+
+      await loadScanHistory()
     } finally {
       setLoading(false)
     }
   }
 
-  const totalPorts = result
-    ? result.hosts.reduce(
-        (total, host) => total + host.ports.length,
-        0,
-      )
-    : 0
+  // ==========================================================
+  // DERIVED
+  // ==========================================================
 
-  const totalServices = result
-    ? result.hosts.reduce(
-        (total, host) =>
-          total +
-          host.ports.filter(
-            (port) => port.service !== null,
-          ).length,
-        0,
-      )
-    : 0
+  // Scan used by the Vulnerabilities and Assets views.
+  const focusScan = result ?? latestScan
 
-  const totalFindings = result
-    ? result.hosts.reduce(
-        (total, host) =>
-          total +
-          host.ports.reduce(
-            (portTotal, port) =>
-              portTotal + port.findings.length,
-            0,
-          ),
-        0,
-      )
-    : 0
+  const dataLoading = loading || latestLoading
 
-  const getConfidence = (riskReason: string | null) => {
-    if (!riskReason) {
-      return 'N/A'
-    }
+  const page = PAGE_TITLES[activeSection]
 
-    const match = riskReason.match(
-      /confidence:\s*(\d+)/i,
-    )
+  const goToHistory = () => setActiveSection('history')
 
-    return match?.[1] ?? 'N/A'
-  }
-
-  const formatValue = (
-    value: string | number | null | undefined,
-  ) => {
-    if (
-      value === null ||
-      value === undefined ||
-      value === ''
-    ) {
-      return 'Not reported'
-    }
-
-    return String(value)
-  }
+  // ==========================================================
+  // UI
+  // ==========================================================
 
   return (
-    <main className="app">
-      <header className="header">
-        <div>
-          <p className="eyebrow">ZYNCLE SECURITY</p>
+    <div className="app">
+      <a className="skip-link" href="#main-content">
+        Skip to content
+      </a>
 
-          <h1>Website Scanner</h1>
+      <Sidebar
+        activeSection={activeSection}
+        onNavigate={setActiveSection}
+        scanActive={loading}
+        apiState={apiState}
+      />
 
-          <p className="subtitle">
-            Port discovery, service detection and vulnerability
-            intelligence in one workflow.
-          </p>
-        </div>
+      <div className="app-content">
+        <Topbar
+          title={page.title}
+          subtitle={page.subtitle}
+          apiState={apiState}
+          scanActive={loading}
+          onOpenCurrentScan={() => setActiveSection('current-scan')}
+        />
 
-        <div className="status-badge">
-          <span />
-          Scanner Online
-        </div>
-      </header>
+        <main id="main-content" className="main" ref={mainRef} tabIndex={-1}>
+          {activeSection === 'dashboard' && (
+            <DashboardPage
+              history={scanHistory}
+              historyLoading={historyLoading}
+              historyError={historyError}
+              onRefresh={() => void loadScanHistory()}
+              latestScan={latestScan}
+              latestLoading={latestLoading}
+              latestError={latestError}
+              scanActive={loading}
+              canViewCurrent={scanId !== null || result !== null}
+              canViewVulnerabilities={focusScan !== null}
+              onNavigate={setActiveSection}
+              onView={(id) => void handleViewScan(id)}
+            />
+          )}
 
-      <section className="scan-card">
-        <label htmlFor="target">
-          Website / Target URL
-        </label>
+          {activeSection === 'new-scan' && (
+            <NewScanPage
+              target={target}
+              onTargetChange={setTarget}
+              profile={profile}
+              onProfileChange={setProfile}
+              vulnerabilityProfile={vulnerabilityProfile}
+              onVulnerabilityProfileChange={setVulnerabilityProfile}
+              loading={loading}
+              scanStatus={scanStatus}
+              onStart={() => void handleStartScan()}
+            />
+          )}
 
-        <div className="scan-row">
-          <input
-            id="target"
-            type="text"
-            value={target}
-            onChange={(event) =>
-              setTarget(event.target.value)
-            }
-            placeholder="http://127.0.0.1:3000"
-            disabled={loading}
-          />
+          {activeSection === 'current-scan' && (
+            <CurrentScanPage
+              loading={loading}
+              scanStatus={scanStatus}
+              scanId={scanId}
+              scanMeta={scanMeta}
+              target={target}
+              profile={profile}
+              vulnerabilityProfile={vulnerabilityProfile}
+              error={error}
+              result={result}
+              onNavigate={setActiveSection}
+              onReloadScan={(id) => void handleViewScan(id)}
+            />
+          )}
 
-          <button
-            type="button"
-            onClick={handleStartScan}
-            disabled={loading}
-          >
-            {loading ? 'SCANNING...' : 'START SCAN'}
-          </button>
-        </div>
+          {activeSection === 'history' && (
+            <HistoryPage
+              history={scanHistory}
+              historyLoading={historyLoading}
+              historyError={historyError}
+              onRefresh={() => void loadScanHistory()}
+              onView={(id) => void handleViewScan(id)}
+              viewDisabled={loading}
+            />
+          )}
 
-        <p className="helper">
-          For testing, use an authorized target such as example.com.
-        </p>
-      </section>
+          {activeSection === 'vulnerabilities' && (
+            <VulnerabilitiesPage
+              scan={focusScan}
+              loading={dataLoading}
+              error={latestError}
+              onChangeScan={goToHistory}
+            />
+          )}
 
-      {loading && (
-        <section className="scan-progress">
-          <div>
-            <p className="section-label">SCAN IN PROGRESS</p>
+          {activeSection === 'assets' && (
+            <AssetsPage
+              scan={focusScan}
+              loading={dataLoading}
+              error={latestError}
+              onChangeScan={goToHistory}
+            />
+          )}
 
-            <h2>
-              {scanId
-                ? `Scan #${scanId}`
-                : 'Starting scan...'}
-            </h2>
-
-            <p>
-              Status:{' '}
-              <strong className="capitalize">
-                {scanStatus}
-              </strong>
-            </p>
-          </div>
-
-          <div className="progress-indicator">
-            Running
-          </div>
-        </section>
-      )}
-
-      {error && (
-        <div className="error">
-          <strong>Scan Error:</strong> {error}
-        </div>
-      )}
-
-      {result && (
-        <>
-          <section className="overview">
-            <div className="summary-card">
-              <span>SCAN ID</span>
-              <strong>#{result.id}</strong>
-            </div>
-
-            <div className="summary-card">
-              <span>STATUS</span>
-
-              <strong className="capitalize">
-                {result.status}
-              </strong>
-            </div>
-
-            <div className="summary-card">
-              <span>HOSTS</span>
-              <strong>{result.hosts.length}</strong>
-            </div>
-
-            <div className="summary-card">
-              <span>OPEN PORTS</span>
-              <strong>{totalPorts}</strong>
-            </div>
-
-            <div className="summary-card">
-              <span>SERVICES</span>
-              <strong>{totalServices}</strong>
-            </div>
-
-            <div className="summary-card">
-              <span>FINDINGS</span>
-              <strong>{totalFindings}</strong>
-            </div>
-          </section>
-
-          <section className="panel">
-            <div className="panel-header">
-              <div>
-                <p className="section-label">TARGET</p>
-
-                <h2>{result.target}</h2>
-              </div>
-
-              <span className="completed">
-                {result.status}
-              </span>
-            </div>
-          </section>
-
-          {result.hosts.map((host) => (
-            <section className="panel" key={host.id}>
-              <div className="panel-header">
-                <div>
-                  <p className="section-label">HOST</p>
-
-                  <h2>{host.address}</h2>
-                </div>
-
-                <span className="host-status">
-                  {host.status}
-                </span>
-              </div>
-
-              <div className="table-wrapper">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>PORT</th>
-                      <th>PROTOCOL</th>
-                      <th>STATE</th>
-                      <th>SERVICE</th>
-                      <th>PRODUCT</th>
-                    </tr>
-                  </thead>
-
-                  <tbody>
-                    {host.ports.map((port) => (
-                      <tr key={port.id}>
-                        <td>{port.port_number}</td>
-
-                        <td>{port.protocol}</td>
-
-                        <td>
-                          <span className="open-state">
-                            {port.state}
-                          </span>
-                        </td>
-
-                        <td>
-                          {port.service?.service_name ??
-                            'Unknown'}
-                        </td>
-
-                        <td>
-                          {port.service?.product ??
-                            'Unknown'}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </section>
-          ))}
-
-          <section className="panel">
-            <div className="panel-header">
-              <div>
-                <p className="section-label">NUCLEI</p>
-
-                <h2>Detection Findings</h2>
-              </div>
-            </div>
-
-            <div className="findings">
-              {result.hosts.flatMap((host) =>
-                host.ports.flatMap((port) =>
-                  port.findings.map((finding) => (
-                    <article
-                      className="finding"
-                      key={finding.id}
-                    >
-                      <div className="finding-main">
-                        <h3>{finding.title}</h3>
-
-                        <p className="finding-meta">
-                          Port {port.port_number} ·{' '}
-                          {finding.source}
-                        </p>
-
-                        <div className="finding-details">
-                          <div>
-                            <span>SEVERITY</span>
-                            <strong>
-                              {formatValue(
-                                finding.severity,
-                              )}
-                            </strong>
-                          </div>
-
-                          <div>
-                            <span>RISK</span>
-                            <strong>
-                              {formatValue(
-                                finding.risk_level,
-                              )}
-                            </strong>
-                          </div>
-
-                          <div>
-                            <span>CONFIDENCE</span>
-                            <strong>
-                              {getConfidence(
-                                finding.risk_reason,
-                              )}
-                            </strong>
-                          </div>
-
-                          <div>
-                            <span>CVE</span>
-                            <strong>
-                              {formatValue(
-                                finding.vulnerability_id,
-                              )}
-                            </strong>
-                          </div>
-
-                          <div>
-                            <span>CVSS</span>
-                            <strong>
-                              {formatValue(
-                                finding.cvss_score,
-                              )}
-                            </strong>
-                          </div>
-
-                          <div>
-                            <span>CWE</span>
-                            <strong>
-                              {formatValue(
-                                finding.cwe_ids,
-                              )}
-                            </strong>
-                          </div>
-                        </div>
-
-                        {finding.cvss_metrics && (
-                          <p>
-                            <strong>
-                              CVSS Metrics:
-                            </strong>{' '}
-                            {finding.cvss_metrics}
-                          </p>
-                        )}
-
-                        {finding.description && (
-                          <p>
-                            <strong>
-                              Description:
-                            </strong>{' '}
-                            {finding.description}
-                          </p>
-                        )}
-
-                        {finding.evidence && (
-                          <p>
-                            <strong>Evidence:</strong>{' '}
-                            {finding.evidence}
-                          </p>
-                        )}
-
-                        {finding.risk_reason && (
-                          <p>
-                            <strong>
-                              Risk Classification:
-                            </strong>{' '}
-                            {finding.risk_reason}
-                          </p>
-                        )}
-                        {finding.matcher_name && (
-                          <p>
-                            <strong>Matcher:</strong> {finding.matcher_name}
-                          </p>
-                        )}
-                      </div>
-
-                      <div>
-                        <span className="severity">
-                          {(
-                            finding.severity ??
-                            'unknown'
-                          ).toUpperCase()}
-                        </span>
-                      </div>
-                    </article>
-                  )),
-                ),
-              )}
-
-              {totalFindings === 0 && (
-                <p>
-                  No findings were returned by the current
-                  vulnerability detection stage.
-                </p>
-              )}
-            </div>
-          </section>
-        </>
-      )}
-    </main>
+          {activeSection === 'settings' && (
+            <SettingsPage
+              apiState={apiState}
+              historyCount={scanHistory.length}
+              profile={profile}
+              vulnerabilityProfile={vulnerabilityProfile}
+            />
+          )}
+        </main>
+      </div>
+    </div>
   )
 }
 

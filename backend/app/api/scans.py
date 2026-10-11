@@ -18,6 +18,8 @@ router = APIRouter(
 
 class ScanCreate(BaseModel):
     target: str
+    profile: str = "common"
+    vulnerability_profile: str = "lightweight"
 
 
 def execute_scan(scan_id: int) -> None:
@@ -62,28 +64,81 @@ def execute_scan(scan_id: int) -> None:
         db.close()
 
 
+# ============================================================
+# CREATE SCAN
+# ============================================================
+
 @router.post("")
 def create_scan(
     scan_data: ScanCreate,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
+    # --------------------------------------------------------
+    # Validate port scan profile
+    # --------------------------------------------------------
+
+    profile = scan_data.profile.strip().lower()
+
+    if profile not in {"common", "full"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid profile. Use 'common' or 'full'.",
+        )
+
+    # --------------------------------------------------------
+    # Validate vulnerability scan profile
+    # --------------------------------------------------------
+
+    vulnerability_profile = (
+        scan_data.vulnerability_profile
+        .strip()
+        .lower()
+    )
+
+    if vulnerability_profile not in {
+        "lightweight",
+        "full",
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid vulnerability_profile. "
+                "Use 'lightweight' or 'full'."
+            ),
+        )
+
+    # --------------------------------------------------------
+    # Normalize target
+    # --------------------------------------------------------
+
     try:
         normalized = normalize_target(scan_data.target)
+
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
             detail=str(exc),
         ) from exc
 
+    # --------------------------------------------------------
+    # Create scan
+    # --------------------------------------------------------
+
     scan = Scan(
         target=normalized.web_url,
         status="pending",
+        profile=profile,
+        vulnerability_profile=vulnerability_profile,
     )
 
     db.add(scan)
     db.commit()
     db.refresh(scan)
+
+    # --------------------------------------------------------
+    # Start background scan
+    # --------------------------------------------------------
 
     background_tasks.add_task(
         execute_scan,
@@ -93,11 +148,89 @@ def create_scan(
     return {
         "id": scan.id,
         "target": scan.target,
+        "profile": scan.profile,
+        "vulnerability_profile": scan.vulnerability_profile,
         "status": scan.status,
         "started_at": scan.started_at,
         "completed_at": scan.completed_at,
     }
 
+
+# ============================================================
+# SCAN HISTORY
+# GET /api/scans
+# ============================================================
+
+@router.get("")
+def get_scan_history(
+    db: Session = Depends(get_db),
+):
+    """
+    Return the latest scan history.
+
+    The newest scans are returned first.
+    Detailed host/port/finding data remains available
+    through GET /api/scans/{scan_id}.
+    """
+
+    scans = (
+        db.query(Scan)
+        .order_by(Scan.id.desc())
+        .limit(50)
+        .all()
+    )
+
+    history = []
+
+    for scan in scans:
+        host_count = 0
+        port_count = 0
+        finding_count = 0
+
+        # Count discovered hosts, ports and findings
+        # from the existing relationships.
+        for host in scan.hosts:
+            host_count += 1
+
+            for port in host.ports:
+                port_count += 1
+
+                if port.service is not None:
+                    finding_count += len(
+                        port.service.findings
+                    )
+
+        history.append(
+            {
+                "id": scan.id,
+                "target": scan.target,
+                "profile": scan.profile,
+                "vulnerability_profile": (
+                    scan.vulnerability_profile
+                ),
+                "status": scan.status,
+                "started_at": scan.started_at,
+                "completed_at": scan.completed_at,
+                "error_message": scan.error_message,
+                "hosts": host_count,
+                "open_ports": port_count,
+                "services": sum(
+                    1
+                    for host in scan.hosts
+                    for port in host.ports
+                    if port.service is not None
+                ),
+                "findings": finding_count,
+            }
+        )
+
+    return history
+
+
+# ============================================================
+# GET SINGLE SCAN
+# GET /api/scans/{scan_id}
+# ============================================================
 
 @router.get("/{scan_id}")
 def get_scan(
@@ -144,15 +277,21 @@ def get_scan(
                             "id": finding.id,
                             "title": finding.title,
                             "description": finding.description,
-                            "vulnerability_id": finding.vulnerability_id,
+                            "vulnerability_id": (
+                                finding.vulnerability_id
+                            ),
                             "severity": finding.severity,
                             "cvss_score": finding.cvss_score,
                             "cwe_ids": finding.cwe_ids,
-                            "cvss_metrics": finding.cvss_metrics,
+                            "cvss_metrics": (
+                                finding.cvss_metrics
+                            ),
                             "risk_level": finding.risk_level,
                             "risk_reason": finding.risk_reason,
                             "source": finding.source,
-                            "matcher_name": finding.matcher_name,
+                            "matcher_name": (
+                                finding.matcher_name
+                            ),
                             "evidence": finding.evidence,
                             "detected_at": finding.detected_at,
                         }
@@ -182,6 +321,10 @@ def get_scan(
     return {
         "id": scan.id,
         "target": scan.target,
+        "profile": scan.profile,
+        "vulnerability_profile": (
+            scan.vulnerability_profile
+        ),
         "status": scan.status,
         "started_at": scan.started_at,
         "completed_at": scan.completed_at,

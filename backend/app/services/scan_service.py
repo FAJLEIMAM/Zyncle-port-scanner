@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import socket
 import time
 
@@ -10,12 +11,26 @@ from app.models.port import Port
 from app.models.scan import Scan
 from app.models.service import Service
 from app.models.finding import Finding
+from datetime import datetime, timezone
 
 from scanner.target import normalize_target
+
+from app.core.config import settings
+
+if settings.naabu_path:
+    os.environ["NAABU_PATH"] = settings.naabu_path
+
+if settings.nuclei_path:
+    os.environ["NUCLEI_PATH"] = settings.nuclei_path
+
+if settings.nmap_path:
+    os.environ["NMAP_PATH"] = settings.nmap_path
+
 from scanner.adapters.naabu import run_naabu
 from scanner.adapters.nmap import run_nmap_service_detection
 from scanner.adapters.nuclei import run_nuclei
 from scanner.adapters.greenbone.client import GreenboneClient
+
 from scanner.risk import classify_risk
 
 from scanner.intelligence.cpe_mapper import (
@@ -29,19 +44,25 @@ from scanner.intelligence.cve_client import (
 )
 
 
+# ============================================================
+# CPE HELPERS
+# ============================================================
+
+
 def _legacy_cpe_to_cpe23(
     cpe: str,
     detected_version: str,
 ) -> str | None:
     """
-    Convert a simple Nmap legacy CPE URI into a CPE 2.3
-    name using the detected service version.
+    Convert a simple Nmap legacy CPE URI into CPE 2.3.
 
     Example:
-        cpe:/a:postgresql:postgresql
-        + version 16.0
 
-        ->
+        cpe:/a:postgresql:postgresql
+        version = 16.0
+
+    becomes:
+
         cpe:2.3:a:postgresql:postgresql:16.0:*:*:*:*:*:*:*
     """
 
@@ -85,6 +106,11 @@ def _legacy_cpe_to_cpe23(
     )
 
 
+# ============================================================
+# SEVERITY
+# ============================================================
+
+
 def _severity_from_cvss(
     cvss_score: float | None,
 ) -> str:
@@ -117,6 +143,11 @@ def _severity_from_cvss(
     return "informational"
 
 
+# ============================================================
+# NVD CORRELATION
+# ============================================================
+
+
 def _add_nvd_findings(
     db: Session,
     services: list[Service],
@@ -125,7 +156,12 @@ def _add_nvd_findings(
     Correlate Nmap service/version/CPE information with NVD.
 
     Returns:
-        (lookup_count, skipped_count, finding_count)
+
+        (
+            lookup_count,
+            skipped_count,
+            finding_count,
+        )
     """
 
     nvd_start = time.perf_counter()
@@ -136,7 +172,7 @@ def _add_nvd_findings(
     skipped_count = 0
     stored_count = 0
 
-    # Prevent duplicate NVD API requests for the same
+    # Prevent duplicate NVD requests for the same
     # CPE + version combination.
     queried: dict[
         tuple[str, str],
@@ -145,21 +181,25 @@ def _add_nvd_findings(
 
     for service in services:
 
-        # ---------------------------------------------------------
-        # CVE lookup requires a CPE.
-        # ---------------------------------------------------------
+        # --------------------------------------------------------
+        # CPE required
+        # --------------------------------------------------------
+
         if not service.cpe:
             skipped_count += 1
             continue
 
-        # ---------------------------------------------------------
-        # CVE lookup requires a detected version.
-        # ---------------------------------------------------------
+        # --------------------------------------------------------
+        # Version required
+        # --------------------------------------------------------
+
         if not service.version:
             skipped_count += 1
             continue
 
-        normalized = normalize_cpe(service.cpe)
+        normalized = normalize_cpe(
+            service.cpe
+        )
 
         if normalized is None:
             skipped_count += 1
@@ -169,9 +209,10 @@ def _add_nvd_findings(
             skipped_count += 1
             continue
 
-        # ---------------------------------------------------------
-        # NVD query currently uses CPE 2.3.
-        # ---------------------------------------------------------
+        # --------------------------------------------------------
+        # Convert CPE to CPE 2.3
+        # --------------------------------------------------------
+
         cpe23 = _legacy_cpe_to_cpe23(
             service.cpe,
             service.version,
@@ -186,13 +227,16 @@ def _add_nvd_findings(
             service.version.strip().lower(),
         )
 
-        # ---------------------------------------------------------
-        # Reuse previous query for identical services.
-        # ---------------------------------------------------------
+        # --------------------------------------------------------
+        # Reuse previous lookup
+        # --------------------------------------------------------
+
         if lookup_key in queried:
+
             cve_records = queried[lookup_key]
 
         else:
+
             print(
                 f"[NVD] Looking up "
                 f"CPE={cpe23} "
@@ -201,6 +245,7 @@ def _add_nvd_findings(
             )
 
             try:
+
                 cve_records = query_cves_by_cpe_and_version(
                     cpe23,
                     service.version,
@@ -210,6 +255,7 @@ def _add_nvd_findings(
                 )
 
             except Exception as exc:
+
                 print(
                     f"[NVD] Lookup failed for "
                     f"{cpe23}: {exc}",
@@ -217,14 +263,17 @@ def _add_nvd_findings(
                 )
 
                 queried[lookup_key] = []
+
                 continue
 
             queried[lookup_key] = cve_records
+
             lookup_count += 1
 
-        # ---------------------------------------------------------
-        # Convert applicable CVEs into backend findings.
-        # ---------------------------------------------------------
+        # --------------------------------------------------------
+        # Store CVE findings
+        # --------------------------------------------------------
+
         for cve in cve_records:
 
             severity = _severity_from_cvss(
@@ -237,9 +286,10 @@ def _add_nvd_findings(
                 confidence=service.confidence,
             )
 
-            # -----------------------------------------------------
-            # Avoid duplicate CVE findings for the same service.
-            # -----------------------------------------------------
+            # ----------------------------------------------------
+            # Avoid duplicate NVD findings
+            # ----------------------------------------------------
+
             existing = (
                 db.query(Finding)
                 .filter(
@@ -295,9 +345,13 @@ def _add_nvd_findings(
             )
 
             db.add(finding)
+
             stored_count += 1
 
-    nvd_duration = time.perf_counter() - nvd_start
+    nvd_duration = (
+        time.perf_counter()
+        - nvd_start
+    )
 
     print(
         f"[PERF] NVD CVE correlation: "
@@ -315,14 +369,278 @@ def _add_nvd_findings(
     )
 
 
+# ============================================================
+# GREENBONE CORRELATION
+# ============================================================
+
+
+def _add_greenbone_findings(
+    db: Session,
+    greenbone_findings: list,
+    hosts: dict[str, Host],
+    target_hostnames: set[str],
+    target_addresses: set[str],
+) -> tuple[int, int, int]:
+    """
+    Correlate Greenbone/OpenVAS findings with services
+    discovered by Nmap and store normalized Finding rows.
+
+    Returns:
+
+        (
+            stored_count,
+            skipped_no_port,
+            skipped_no_service,
+        )
+    """
+
+    stored_count = 0
+    skipped_no_port = 0
+    skipped_no_service = 0
+
+    for greenbone_finding in greenbone_findings:
+
+        # --------------------------------------------------------
+        # Greenbone result needs a port for service correlation
+        # --------------------------------------------------------
+
+        if greenbone_finding.port is None:
+
+            skipped_no_port += 1
+
+            continue
+
+        # --------------------------------------------------------
+        # Normalize Greenbone host
+        # --------------------------------------------------------
+
+        finding_host = (
+            greenbone_finding.host.strip().lower()
+            if greenbone_finding.host
+            else None
+        )
+
+        matching_service = None
+
+        # --------------------------------------------------------
+        # Find matching database host
+        # --------------------------------------------------------
+
+        for host in hosts.values():
+
+            host_address = (
+                host.address.strip().lower()
+            )
+
+            if finding_host:
+
+                host_matches = (
+                    finding_host == host_address
+                    or finding_host in target_hostnames
+                    or finding_host in target_addresses
+                )
+
+                if not host_matches:
+                    continue
+
+            else:
+
+                # If Greenbone does not provide a host and
+                # exactly one host was discovered, use it.
+                if len(hosts) != 1:
+                    continue
+
+            # ----------------------------------------------------
+            # Find matching port/service
+            # ----------------------------------------------------
+
+            for port in host.ports:
+
+                if (
+                    port.port_number
+                    != greenbone_finding.port
+                ):
+                    continue
+
+                if port.service is None:
+                    continue
+
+                matching_service = port.service
+
+                break
+
+            if matching_service is not None:
+                break
+
+        # --------------------------------------------------------
+        # No matching service
+        # --------------------------------------------------------
+
+        if matching_service is None:
+
+            skipped_no_service += 1
+
+            continue
+
+        # --------------------------------------------------------
+        # CVSS / Severity
+        # --------------------------------------------------------
+
+        cvss_score = (
+            greenbone_finding.cvss_score
+        )
+
+        severity = (
+            greenbone_finding.severity
+        )
+
+        if not severity:
+
+            severity = _severity_from_cvss(
+                cvss_score
+            )
+
+        # --------------------------------------------------------
+        # Risk classification
+        # --------------------------------------------------------
+
+        risk_result = classify_risk(
+            severity=severity,
+            cvss_score=cvss_score,
+            confidence=matching_service.confidence,
+        )
+
+        # --------------------------------------------------------
+        # Vulnerability ID
+        # --------------------------------------------------------
+
+        vulnerability_id = None
+
+        if greenbone_finding.cve_ids:
+
+            vulnerability_id = (
+                greenbone_finding.cve_ids[0]
+            )
+
+        # --------------------------------------------------------
+        # Evidence
+        # --------------------------------------------------------
+
+        evidence = (
+            greenbone_finding.evidence
+        )
+
+        if not evidence:
+
+            evidence = (
+                "Greenbone/OpenVAS detected on "
+                f"{finding_host or 'target'}:"
+                f"{greenbone_finding.port}"
+            )
+
+        # --------------------------------------------------------
+        # Duplicate check
+        # --------------------------------------------------------
+
+        existing = (
+            db.query(Finding)
+            .filter(
+                Finding.service_id
+                == matching_service.id,
+
+                Finding.vulnerability_id
+                == vulnerability_id,
+
+                Finding.title
+                == greenbone_finding.name,
+
+                Finding.source
+                == "greenbone",
+            )
+            .first()
+        )
+
+        if existing is not None:
+            continue
+
+        # --------------------------------------------------------
+        # Create normalized finding
+        # --------------------------------------------------------
+
+        finding = Finding(
+            service_id=matching_service.id,
+
+            title=greenbone_finding.name,
+
+            description=(
+                greenbone_finding.description
+                or greenbone_finding.solution
+                or (
+                    "Greenbone/OpenVAS "
+                    "vulnerability finding."
+                )
+            ),
+
+            vulnerability_id=vulnerability_id,
+
+            severity=severity,
+
+            cvss_score=cvss_score,
+
+            cvss_metrics=getattr(
+                greenbone_finding,
+                "cvss_metrics",
+                None,
+            ),
+
+            cwe_ids=(
+                ",".join(
+                    greenbone_finding.cwe_ids
+                )
+                if greenbone_finding.cwe_ids
+                else None
+            ),
+
+            risk_level=risk_result.level,
+
+            risk_reason=(
+                "Greenbone/OpenVAS vulnerability "
+                "correlation. "
+                f"{risk_result.reason}"
+            ),
+
+            source="greenbone",
+
+            matcher_name="greenbone",
+
+            evidence=evidence,
+        )
+
+        db.add(finding)
+
+        stored_count += 1
+
+    return (
+        stored_count,
+        skipped_no_port,
+        skipped_no_service,
+    )
+
+
+# ============================================================
+# MAIN SCAN PIPELINE
+# ============================================================
+
+
 def run_port_scan(
     db: Session,
     scan: Scan,
 ) -> None:
 
-    # =========================================================
-    # TOTAL SCAN TIMER
-    # =========================================================
+    # ========================================================
+    # TOTAL TIMER
+    # ========================================================
+
     total_start = time.perf_counter()
 
     print(
@@ -331,12 +649,17 @@ def run_port_scan(
         flush=True,
     )
 
-    # =========================================================
+    # ========================================================
     # Target normalization
-    # =========================================================
-    normalization_start = time.perf_counter()
+    # ========================================================
 
-    target = normalize_target(scan.target)
+    normalization_start = (
+        time.perf_counter()
+    )
+
+    target = normalize_target(
+        scan.target
+    )
 
     print(
         f"[PERF] Target normalization: "
@@ -344,9 +667,10 @@ def run_port_scan(
         flush=True,
     )
 
-    # =========================================================
-    # Phase 1: Port discovery with Naabu
-    # =========================================================
+    # ========================================================
+    # Phase 1: Naabu port discovery
+    # ========================================================
+
     naabu_start = time.perf_counter()
 
     print(
@@ -354,20 +678,57 @@ def run_port_scan(
         flush=True,
     )
 
-    results = run_naabu(target.host)
+    results = run_naabu(
+        target.host,
+        profile=scan.profile,
+    )
 
-    naabu_duration = time.perf_counter() - naabu_start
+    naabu_duration = (
+        time.perf_counter()
+        - naabu_start
+    )
 
     print(
-        f"[PERF] Naabu: {naabu_duration:.3f}s "
+        f"[PERF] Naabu: "
+        f"{naabu_duration:.3f}s "
         f"({len(results)} results)",
         flush=True,
     )
 
-    # =========================================================
+        # ========================================================
+    # EARLY EXIT: No reachable/open ports discovered
+    # ========================================================
+
+    if not results:
+        print(
+            "[SCAN] No reachable/open ports discovered. "
+            "Skipping Nmap, NVD, Nuclei, and Greenbone.",
+            flush=True,
+        )
+
+        scan.status = "completed"
+        scan.completed_at = datetime.now(timezone.utc)
+        scan.error_message = (
+            "No reachable/open ports discovered."
+        )
+
+        db.commit()
+
+        print(
+            f"[SCAN] Completed scan #{scan.id} - no open ports",
+            flush=True,
+        )
+
+        return
+
+
+    # ========================================================
     # Create hosts and ports
-    # =========================================================
-    db_host_port_start = time.perf_counter()
+    # ========================================================
+
+    db_host_port_start = (
+        time.perf_counter()
+    )
 
     hosts: dict[str, Host] = {}
 
@@ -382,6 +743,7 @@ def run_port_scan(
             )
 
             db.add(host)
+
             db.flush()
 
             hosts[result.ip] = host
@@ -406,16 +768,21 @@ def run_port_scan(
     )
 
     print(
-        f"[SCAN] Discovered {len(hosts)} host(s)",
+        f"[SCAN] Discovered "
+        f"{len(hosts)} host(s)",
         flush=True,
     )
 
-    # =========================================================
-    # Phase 2: Service and version detection with Nmap
-    # =========================================================
+    # ========================================================
+    # Phase 2: Nmap service/version detection
+    # ========================================================
+
     nmap_start = time.perf_counter()
 
-    ports_by_host: dict[str, list[int]] = {}
+    ports_by_host: dict[
+        str,
+        list[int],
+    ] = {}
 
     for result in results:
 
@@ -426,7 +793,7 @@ def run_port_scan(
 
     total_nmap_results = 0
 
-    # Keep references for NVD correlation.
+    # Keep service references for NVD correlation.
     detected_services: list[Service] = []
 
     for ip, port_numbers in ports_by_host.items():
@@ -437,11 +804,15 @@ def run_port_scan(
             flush=True,
         )
 
-        nmap_host_start = time.perf_counter()
+        nmap_host_start = (
+            time.perf_counter()
+        )
 
-        nmap_results = run_nmap_service_detection(
-            ip,
-            port_numbers,
+        nmap_results = (
+            run_nmap_service_detection(
+                ip,
+                port_numbers,
+            )
         )
 
         nmap_host_duration = (
@@ -449,7 +820,9 @@ def run_port_scan(
             - nmap_host_start
         )
 
-        total_nmap_results += len(nmap_results)
+        total_nmap_results += (
+            len(nmap_results)
+        )
 
         print(
             f"[PERF] Nmap {ip}: "
@@ -466,8 +839,14 @@ def run_port_scan(
                 (
                     port
                     for port in host.ports
-                    if port.port_number == nmap_result.port
-                    and port.protocol == nmap_result.protocol
+                    if (
+                        port.port_number
+                        == nmap_result.port
+                    )
+                    and (
+                        port.protocol
+                        == nmap_result.protocol
+                    )
                 ),
                 None,
             )
@@ -477,21 +856,44 @@ def run_port_scan(
 
             service = Service(
                 port_id=port.id,
-                service_name=nmap_result.service_name,
-                product=nmap_result.product,
-                version=nmap_result.version,
-                cpe=nmap_result.cpe,
-                confidence=nmap_result.confidence,
-                banner=nmap_result.banner,
+
+                service_name=(
+                    nmap_result.service_name
+                ),
+
+                product=(
+                    nmap_result.product
+                ),
+
+                version=(
+                    nmap_result.version
+                ),
+
+                cpe=(
+                    nmap_result.cpe
+                ),
+
+                confidence=(
+                    nmap_result.confidence
+                ),
+
+                banner=(
+                    nmap_result.banner
+                ),
             )
 
             db.add(service)
 
-            detected_services.append(service)
+            detected_services.append(
+                service
+            )
 
     db.flush()
 
-    nmap_duration = time.perf_counter() - nmap_start
+    nmap_duration = (
+        time.perf_counter()
+        - nmap_start
+    )
 
     print(
         f"[PERF] Nmap TOTAL: "
@@ -500,28 +902,19 @@ def run_port_scan(
         flush=True,
     )
 
-    # =========================================================
+    # ========================================================
     # Phase 3: NVD CVE correlation
-    # =========================================================
-    #
-    # Only services with:
-    #
-    #     CPE + version
-    #
-    # are sent to NVD.
-    #
-    # Services without a reliable version are skipped rather
-    # than receiving blind CVE associations.
-    # =========================================================
+    # ========================================================
 
     _add_nvd_findings(
         db,
         detected_services,
     )
 
-    # =========================================================
-    # Resolve target hostname to IPv4 addresses
-    # =========================================================
+    # ========================================================
+    # DNS resolution
+    # ========================================================
+
     dns_start = time.perf_counter()
 
     resolved_target_ips: set[str] = set()
@@ -540,14 +933,19 @@ def run_port_scan(
             ip_address = item[4][0]
 
             if ip_address:
+
                 resolved_target_ips.add(
                     ip_address.lower()
                 )
 
     except socket.gaierror:
+
         pass
 
-    dns_duration = time.perf_counter() - dns_start
+    dns_duration = (
+        time.perf_counter()
+        - dns_start
+    )
 
     print(
         f"[PERF] DNS resolution: "
@@ -556,9 +954,10 @@ def run_port_scan(
         flush=True,
     )
 
-    # =========================================================
-    # Target hostname aliases that can identify the same target
-    # =========================================================
+    # ========================================================
+    # Target aliases
+    # ========================================================
+
     target_hostnames = {
         target.host.lower(),
     }
@@ -568,23 +967,30 @@ def run_port_scan(
         for address in resolved_target_ips
     }
 
-    # =========================================================
-    # Phase 4: Nuclei vulnerability / CVE detection
-    # =========================================================
+    # ========================================================
+    # Phase 4: Nuclei vulnerability detection
+    # ========================================================
+
     nuclei_start = time.perf_counter()
 
     print(
-        f"[NUCLEI] Starting for {target.web_url}",
+        f"[NUCLEI] Starting for "
+        f"{target.web_url}",
         flush=True,
     )
 
     nuclei_findings = run_nuclei(
         target.web_url,
         tags="vuln,cve",
-        severity="low,medium,high,critical",
+        severity=(
+            "low,medium,high,critical"
+        ),
     )
 
-    nuclei_duration = time.perf_counter() - nuclei_start
+    nuclei_duration = (
+        time.perf_counter()
+        - nuclei_start
+    )
 
     print(
         f"[PERF] Nuclei: "
@@ -593,10 +999,13 @@ def run_port_scan(
         flush=True,
     )
 
-    # =========================================================
+    # ========================================================
     # Phase 5: Store Nuclei findings
-    # =========================================================
-    findings_start = time.perf_counter()
+    # ========================================================
+
+    findings_start = (
+        time.perf_counter()
+    )
 
     stored_findings = 0
     skipped_no_port = 0
@@ -605,14 +1014,17 @@ def run_port_scan(
     for nuclei_finding in nuclei_findings:
 
         if nuclei_finding.port is None:
+
             skipped_no_port += 1
+
             continue
 
         matching_service = None
 
-        # -----------------------------------------------------
-        # Normalize Nuclei host value
-        # -----------------------------------------------------
+        # ----------------------------------------------------
+        # Normalize Nuclei host
+        # ----------------------------------------------------
+
         finding_host = None
 
         if nuclei_finding.host:
@@ -623,9 +1035,10 @@ def run_port_scan(
                 .lower()
             )
 
-        # -----------------------------------------------------
-        # Match Nuclei host to database host
-        # -----------------------------------------------------
+        # ----------------------------------------------------
+        # Match host
+        # ----------------------------------------------------
+
         for host in hosts.values():
 
             host_address = (
@@ -637,61 +1050,73 @@ def run_port_scan(
             if finding_host:
 
                 host_matches = (
-                    finding_host == host_address
-                    or finding_host in target_hostnames
-                    or finding_host in target_addresses
+                    finding_host
+                    == host_address
+                    or finding_host
+                    in target_hostnames
+                    or finding_host
+                    in target_addresses
                 )
 
                 if not host_matches:
                     continue
 
-            # -------------------------------------------------
-            # Match Nuclei port to discovered port
-            # -------------------------------------------------
+            # ------------------------------------------------
+            # Match port
+            # ------------------------------------------------
+
             for port in host.ports:
 
-                if port.port_number != nuclei_finding.port:
+                if (
+                    port.port_number
+                    != nuclei_finding.port
+                ):
                     continue
 
                 if port.service is None:
                     continue
 
-                matching_service = port.service
+                matching_service = (
+                    port.service
+                )
+
                 break
 
             if matching_service is not None:
                 break
 
-        # -----------------------------------------------------
+        # ----------------------------------------------------
         # No matching service
-        # -----------------------------------------------------
+        # ----------------------------------------------------
+
         if matching_service is None:
+
             skipped_no_service += 1
+
             continue
 
-        # =====================================================
+        # ----------------------------------------------------
         # CVSS
-        # =====================================================
-        #
-        # Do not invent CVSS.
-        #
-        # Nuclei adapter supplies CVSS only when actually
-        # present in its metadata.
-        # =====================================================
-        cvss_score = nuclei_finding.cvss_score
+        # ----------------------------------------------------
 
-        # =====================================================
+        cvss_score = (
+            nuclei_finding.cvss_score
+        )
+
+        # ----------------------------------------------------
         # Risk classification
-        # =====================================================
+        # ----------------------------------------------------
+
         risk_result = classify_risk(
             severity=nuclei_finding.severity,
             cvss_score=cvss_score,
             confidence=matching_service.confidence,
         )
 
-        # =====================================================
-        # Create finding record
-        # =====================================================
+        # ----------------------------------------------------
+        # Create Finding
+        # ----------------------------------------------------
+
         finding = Finding(
             service_id=matching_service.id,
 
@@ -702,16 +1127,24 @@ def run_port_scan(
                 f"{nuclei_finding.template_id}"
             ),
 
-            vulnerability_id=nuclei_finding.cve_id,
+            vulnerability_id=(
+                nuclei_finding.cve_id
+            ),
 
-            severity=nuclei_finding.severity,
+            severity=(
+                nuclei_finding.severity
+            ),
 
             cvss_score=cvss_score,
 
-            cvss_metrics=nuclei_finding.cvss_metrics,
+            cvss_metrics=(
+                nuclei_finding.cvss_metrics
+            ),
 
             cwe_ids=(
-                ",".join(nuclei_finding.cwe_ids)
+                ",".join(
+                    nuclei_finding.cwe_ids
+                )
                 if nuclei_finding.cwe_ids
                 else None
             ),
@@ -722,9 +1155,13 @@ def run_port_scan(
 
             source="nuclei",
 
-            matcher_name=nuclei_finding.matcher_name,
+            matcher_name=(
+                nuclei_finding.matcher_name
+            ),
 
-            evidence=nuclei_finding.matched_at,
+            evidence=(
+                nuclei_finding.matched_at
+            ),
         )
 
         db.add(finding)
@@ -745,21 +1182,37 @@ def run_port_scan(
         flush=True,
     )
 
-        # =========================================================
-    # Phase 6: Optional Greenbone/OpenVAS correlation
-    # =========================================================
+    # ========================================================
+    # Phase 6: Greenbone/OpenVAS
+    # ========================================================
+
     greenbone = GreenboneClient()
 
     if greenbone.is_available():
-        greenbone_start = time.perf_counter()
+
+        greenbone_start = (
+            time.perf_counter()
+        )
 
         print(
-            f"[GREENBONE] Starting for {target.web_url}",
+            f"[GREENBONE] Starting for "
+            f"{target.host}",
             flush=True,
         )
 
         try:
-            greenbone_findings = greenbone.scan(target.web_url)
+
+            # ------------------------------------------------
+            # Start Greenbone scan
+            # ------------------------------------------------
+
+            greenbone_findings = (
+                greenbone.scan(
+                    target.host,
+                    scan_id=scan.id,
+                    vulnerability_profile=scan.vulnerability_profile,
+                )
+            )
 
             print(
                 f"[GREENBONE] Findings received: "
@@ -767,25 +1220,49 @@ def run_port_scan(
                 flush=True,
             )
 
-            # Live Greenbone result storage will be connected
-            # here when a GMP/OSP service is configured.
-            for greenbone_finding in greenbone_findings:
-                print(
-                    f"[GREENBONE] "
-                    f"{greenbone_finding.name} "
-                    f"host={greenbone_finding.host} "
-                    f"port={greenbone_finding.port}",
-                    flush=True,
-                )
+            # ------------------------------------------------
+            # Normalize + store findings
+            # ------------------------------------------------
+
+            (
+                greenbone_stored,
+                greenbone_skipped_no_port,
+                greenbone_skipped_no_service,
+            ) = _add_greenbone_findings(
+                db=db,
+                greenbone_findings=(
+                    greenbone_findings
+                ),
+                hosts=hosts,
+                target_hostnames=(
+                    target_hostnames
+                ),
+                target_addresses=(
+                    target_addresses
+                ),
+            )
+
+            print(
+                f"[GREENBONE] Stored: "
+                f"{greenbone_stored}, "
+                f"skipped_no_port="
+                f"{greenbone_skipped_no_port}, "
+                f"skipped_no_service="
+                f"{greenbone_skipped_no_service}",
+                flush=True,
+            )
 
         except Exception as exc:
+
             print(
-                f"[GREENBONE] Integration error: {exc}",
+                f"[GREENBONE] Integration error: "
+                f"{exc}",
                 flush=True,
             )
 
         greenbone_duration = (
-            time.perf_counter() - greenbone_start
+            time.perf_counter()
+            - greenbone_start
         )
 
         print(
@@ -793,22 +1270,27 @@ def run_port_scan(
             f"{greenbone_duration:.3f}s",
             flush=True,
         )
+
     else:
+
         print(
             "[GREENBONE] Disabled "
-            "(no live Greenbone/OpenVAS service configured)",
+            "(GREENBONE_ENABLED is not true)",
             flush=True,
         )
 
-
-    # =========================================================
+    # ========================================================
     # Final persistence
-    # =========================================================
+    # ========================================================
+
     db_start = time.perf_counter()
 
     db.commit()
 
-    db_duration = time.perf_counter() - db_start
+    db_duration = (
+        time.perf_counter()
+        - db_start
+    )
 
     print(
         f"[PERF] DB commit: "
@@ -816,9 +1298,10 @@ def run_port_scan(
         flush=True,
     )
 
-    # =========================================================
+    # ========================================================
     # TOTAL
-    # =========================================================
+    # ========================================================
+
     total_duration = (
         time.perf_counter()
         - total_start

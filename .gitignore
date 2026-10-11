@@ -1,4 +1,4 @@
-# Python
+﻿# Python
 __pycache__/
 *.py[cod]
 .venv/
@@ -17,3 +17,22 @@ dist/
 *.log
 .DS_Store
 Thumbs.db
+
+# Temporary backups
+*.backup
+*.backup-*
+*.before-*
+frontend-backup/
+
+# Build outputs
+frontend/dist/
+backend/dist/
+
+# Local databases and temporary files
+*.sqlite
+*.sqlite3
+*.db
+*.tmp
+
+# Backup files with extensions
+*.backup.*
