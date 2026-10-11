@@ -169,8 +169,8 @@ Behavior worth knowing:
 │   │   ├── services/scan_service.py   # scan pipeline orchestration
 │   │   └── db_test.py           # database connectivity check
 │   ├── migrations/              # Alembic environment + 10 revisions
-│   ├── test_scan_service.py     # manual script (not a pytest test)
-│   └── test_nmap_integration.py # manual script (not a pytest test)
+│   ├── test_scan_service.py     # manual script, runs a real scan (not a pytest test)
+│   └── test_nmap_integration.py # manual script, runs a real scan (not a pytest test)
 ├── scanner/
 │   ├── target.py                # target normalization
 │   ├── risk.py                  # risk classification
@@ -184,7 +184,7 @@ Behavior worth knowing:
 ├── tests/
 │   └── test_cve_applicability.py
 └── docs/
-    └── screenshots/             # add sanitized screenshots here
+    └── screenshots/             # not created yet; add sanitized screenshots here
 ```
 
 ## Prerequisites
@@ -253,7 +253,7 @@ GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO zyncle_rw;
 
 ### Environment variable reference
 
-Create `backend\.env` (it is git-ignored). Never commit it and never paste real values into issues or screenshots.
+Create `backend\.env` (it is git-ignored). The backend loads it by absolute path (`backend/.env`, resolved from `backend/app/core/config.py`), so the working directory does not matter. Real environment variables take precedence over `.env`. Never commit the file and never paste real values into issues or screenshots.
 
 ```dotenv
 # Required
@@ -374,7 +374,9 @@ If PowerShell blocks the script: `powershell -ExecutionPolicy Bypass -File .\sta
 | Backend | `python -m uvicorn app.main:app --app-dir <repo-root> --reload --host 127.0.0.1 --port 8000` (from `backend/`) | <http://127.0.0.1:8000> |
 | Frontend | `npm run dev -- --host 127.0.0.1` (from `frontend/`) | <http://127.0.0.1:5173> (check the Vite window if the port differs) |
 
-It does **not** check `.env`, PostgreSQL, scanner tools or migrations.
+It does **not** check `.env`, PostgreSQL, scanner tools or migrations. `app` is imported from the working directory (`backend/`) and the top-level `scanner/` package from `--app-dir` (the repository root). The paths are interpolated into single-quoted PowerShell strings, so a repository path containing an apostrophe will break the launcher.
+
+> The launcher behavior above is taken from reading `start.ps1`. See [Testing and validation](#testing-and-validation) for what has actually been executed.
 
 | Resource | URL |
 |---|---|
@@ -386,11 +388,11 @@ A production build (`npm --prefix frontend run build`) writes to `frontend/dist`
 
 ## API documentation
 
-Routes extracted from the FastAPI application. All responses are JSON.
+Routes extracted from `backend/app/main.py` and `backend/app/api/scans.py`; the frontend (`frontend/src/api.ts`) calls only the three `/api/scans` routes. There is no update or delete route. All responses are JSON.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/health` | `{"status": "ok", "service": "zyncle-port-scanner"}` |
+| `GET` | `/api/health` | `{"status": "ok", "service": "zyncle-port-scanner"}` (not called by the bundled frontend) |
 | `POST` | `/api/scans` | Create a scan and start it in the background |
 | `GET` | `/api/scans` | Latest 50 scans, newest first, with counts |
 | `GET` | `/api/scans/{scan_id}` | Full scan detail |
@@ -403,7 +405,7 @@ Routes extracted from the FastAPI application. All responses are JSON.
 | `profile` | string | `common` | `common`, `full` |
 | `vulnerability_profile` | string | `lightweight` | `lightweight`, `full` |
 
-Values are trimmed and case-insensitive. Returns `200` with `id`, `target` (normalized to a URL), `profile`, `vulnerability_profile`, `status` (`pending`), `started_at`, `completed_at`. Errors: `400` with a `detail` message (invalid profile or target), `422` for a malformed body.
+Values are trimmed and case-insensitive. Returns `200` with `id`, `target` (normalized to a URL), `profile`, `vulnerability_profile`, `status` (`pending`), `started_at` and `completed_at`. Both timestamps are `null` in this response: `started_at` is set when the background task begins and `completed_at` when it ends. Errors: `400` with a `detail` message (invalid profile or target), `422` for a malformed body.
 
 ```powershell
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/scans `
@@ -417,10 +419,12 @@ Each item: `id`, `target`, `profile`, `vulnerability_profile`, `status`, `starte
 
 ### `GET /api/scans/{scan_id}`
 
-Scan fields as above, plus `hosts[]` → `ports[]` (`port_number`, `protocol`, `state`, `service`, `findings[]`).
+Scan fields as above (without the counts), plus `hosts[]`:
 
-- `service`: `service_name`, `product`, `version`, `cpe`, `confidence`, `banner` (or `null`).
-- finding: `title`, `description`, `vulnerability_id`, `severity`, `cvss_score`, `cwe_ids` (comma-separated string), `cvss_metrics`, `risk_level`, `risk_reason`, `source`, `matcher_name`, `evidence`, `detected_at`.
+- host: `id`, `address`, `hostname`, `status`, `ports[]`. The pipeline stores `status` as `up` and does not populate `hostname`, so it is currently always `null`.
+- port: `id`, `port_number`, `protocol`, `state`, `service` (or `null`), `findings[]`. Findings are attached to the port's service, so a port without a detected service has an empty list.
+- `service`: `id`, `service_name`, `product`, `version`, `cpe`, `confidence`, `banner`.
+- finding: `id`, `title`, `description`, `vulnerability_id`, `severity`, `cvss_score`, `cwe_ids` (comma-separated string), `cvss_metrics`, `risk_level`, `risk_reason`, `source`, `matcher_name`, `evidence`, `detected_at`.
 
 Returns `404` (`"Scan not found"`) for an unknown id.
 
@@ -428,22 +432,32 @@ Returns `404` (`"Scan not found"`) for an unknown id.
 
 ## Testing and validation
 
-Status as of 2026-10-11, checked on Linux (Python 3.12, Node 22, PostgreSQL 16). Scanner executables were replaced by stubs for API checks, so those checks cover API and persistence behavior, not scan accuracy.
+Results are split into what was re-checked while auditing this documentation (2026-10-11, Linux, Python 3.12.3, Node 22.22, no network access) and results reported earlier that were **not** re-run. The audit environment had no PostgreSQL, no Naabu/Nmap/Nuclei and no installed backend dependencies, and the copied `frontend/node_modules` contained only Windows native bindings.
+
+**Re-checked during the audit**
 
 | Check | Status |
 |---|---|
-| `npm --prefix frontend run build` (`tsc -b` + Vite) | ✅ Passed |
-| `npm --prefix frontend run lint` | ✅ 0 errors, 1 warning (`react/set-state-in-effect` in `App.tsx`) |
-| `pip install -r backend/requirements.txt` | ✅ Passed |
-| Alembic: single head, `upgrade head`, `alembic check` | ✅ No drift detected |
-| API smoke test (all routes, 400/404/422, CORS, failure and no-open-ports paths) | ✅ Passed with stub scanners |
-| DML-only database role runs the full API flow | ✅ Passed |
-| `tests/test_cve_applicability.py` (7 pytest tests) | ❌ Does not collect: stray character at line 134 (`cve,s`). All 7 pass once fixed. |
-| Real Naabu, Nmap, Nuclei runs; live NVD lookups; Greenbone | ⬜ Not verified |
-| `start.ps1` on Windows; Python 3.14; other PostgreSQL versions | ⬜ Not verified |
-| Frontend unit/e2e tests, CI | ⬜ None exist |
+| `tests/test_cve_applicability.py` collects | ❌ `SyntaxError` at line 134 (`cve,s`) |
+| The same 7 tests with line 134 corrected in a temporary copy (repository file untouched) | ✅ 7 of 7 passed |
+| `tsc -b` (type-check step of `npm run build`) | ✅ finished without errors |
+| Alembic revision chain, read from the `down_revision` values | ✅ one linear chain of 10 revisions, head `28b118ae6d18` |
+| Vite bundling and `npm run lint` (oxlint) | ⬜ could not run here (Windows-only native bindings) |
 
-<!-- AUTHOR TODO: after fixing tests/test_cve_applicability.py line 134, change that row to "✅ 7 passed". -->
+**Reported earlier by the author, not re-run**
+
+| Check | Reported result |
+|---|---|
+| `npm --prefix frontend run build` | Passed |
+| `npm --prefix frontend run lint` | 0 errors, 1 warning (`react/set-state-in-effect` in `App.tsx`) |
+| `pip install -r backend/requirements.txt` | Passed |
+| Alembic `upgrade head` and `alembic check` | No drift detected |
+| API smoke test with stub scanners (all routes, 400/404/422, CORS, failure and no-open-ports paths) | Passed |
+| Full API flow with a DML-only database role | Passed |
+
+**Not verified:** real Naabu, Nmap and Nuclei runs, live NVD lookups, Greenbone, `start.ps1` on Windows, Python 3.14 and PostgreSQL versions other than 16. **Do not exist:** frontend unit/e2e tests, API tests and CI.
+
+<!-- AUTHOR TODO: after fixing tests/test_cve_applicability.py line 134, change the first row to "✅ 7 passed" and re-run the earlier-reported checks to refresh this section. -->
 
 ```powershell
 backend\.venv\Scripts\python.exe -m pip install pytest
@@ -452,7 +466,7 @@ npm --prefix frontend run build
 npm --prefix frontend run lint
 ```
 
-> Always pass `tests` to pytest. `backend/test_scan_service.py` and `backend/test_nmap_integration.py` are manual scripts that execute a real scan at import time, so they must not be collected.
+> Always pass `tests` to pytest. `backend/test_scan_service.py` and `backend/test_nmap_integration.py` are manual scripts, not tests: they run a real scan of `127.0.0.1` at import time and start with a `sys.path.insert(...)` line containing a hard-coded Windows path that you must edit before use. They must not be collected by pytest.
 
 ## Troubleshooting
 
@@ -465,10 +479,11 @@ npm --prefix frontend run lint
 | `start.ps1` reports a missing virtual environment or dependencies | Repeat [steps 2 and 3](#2-backend-dependencies). |
 | `start.ps1` is blocked | PowerShell execution policy; see [Running the application](#running-the-application). |
 | Dashboard shows "API unreachable" | Backend not running, or Vite is on a port other than 5173 (CORS only allows 5173). |
-| Scan stays `pending` or `running` | Backend restarted mid-scan (scans run in-process and are not recovered), or a long `full` profile. Limits: Nmap 120 s per host, Nuclei 900 s by default, Greenbone 7200 s. |
+| Scan stays `pending` or `running` | Backend restarted mid-scan (scans run in-process and are not recovered), or a long `full` profile. Limits: Nmap 120 s per host, Nuclei 900 s by default, Greenbone 7200 s. Naabu has no process timeout. |
 | Scan `failed` | Read `error_message` and the backend window. Typical causes are a tool exiting non-zero or timing out. |
 | No findings | NVD correlation needs both a CPE and a version from Nmap; Nuclei needs templates installed; Greenbone is off by default. |
 | `NVD_API_KEY` or `NUCLEI_PROCESS_TIMEOUT` has no effect | They must be real environment variables, not `.env` entries. |
+| `npm run build` or `npm run lint` fails with "Permission denied" or a missing native binding | `node_modules` was copied from another operating system. Delete `frontend/node_modules` and run `npm --prefix frontend ci` on the machine that will build. |
 
 ## Security considerations
 
@@ -478,10 +493,10 @@ npm --prefix frontend run lint
 |---|---|
 | Secrets | Keep `backend\.env` out of Git; never commit credentials, API keys or private connection URLs. `.gitignore` excludes `.env`, `.env.*`, `.venv/`, `node_modules/`, `dist/`, `__pycache__/` and `*.log`. |
 | Database | Use the least-privilege role described above; use a unique strong password. |
-| Access control | **The API has no authentication or authorization.** Anyone who can reach port 8000 can launch scans against arbitrary targets. Keep it bound to `127.0.0.1` and do not expose it to a network. CORS is not access control. |
+| Access control | **The API has no authentication or authorization.** Anyone who can reach port 8000 can launch scans against arbitrary targets and read every stored result. Keep it bound to `127.0.0.1` and do not expose it to a network. CORS is not access control. |
 | Target scope | Input is only checked for a valid hostname. There is no allow-list or private-range restriction, so enforce scope yourself. |
 | Scan results | Banners, versions and findings are stored in plaintext and exported by the UI as `zyncle-scan-<id>.json/.csv` into the browser's download folder. Treat both as sensitive. |
-| Error output | A failed scan's `error_message` can contain the full tool command line and local executable path. |
+| Error output | A failed scan's `error_message` is stored and returned by the API; for example a Naabu failure includes the full command line and local executable path, and Nmap/Nuclei failures include the tool's stderr. The Nmap command line is also printed to the backend console. |
 | Scanner behavior | Naabu and Nuclei rate/concurrency are hard-coded and aggressive. Nuclei runs with Interactsh disabled; detected product/version strings (CPE) are sent to the NVD API. |
 | Migrations | Review the SQL and back up data before applying; avoid downgrades on real data. |
 
@@ -492,9 +507,10 @@ npm --prefix frontend run lint
 - History returns only the latest 50 scans, without pagination.
 - The API reports overall status only, so the UI cannot show per-stage progress.
 - `vulnerability_profile` affects only Greenbone; findings are stored only when matched to a discovered service.
-- Tool tuning is hard-coded; only the executable paths and the Nuclei timeout are configurable.
+- Tool tuning is hard-coded; only the executable paths and the Nuclei timeout are configurable. The Naabu process has no timeout.
 - Frontend uses state-based navigation (no URL routing); API address and CORS origins are fixed to local development values.
-- `start.ps1` is Windows-only. No Dockerfile, CI, or Linux/macOS launcher is provided.
+- `start.ps1` is Windows-only and breaks on repository paths containing an apostrophe. No Dockerfile, CI, or Linux/macOS launcher is provided.
+- The two manual scripts in `backend/` contain a hard-coded local path and run real scans when imported.
 - Test coverage is limited to one unit-test module (CVE version applicability); there are no API or frontend tests.
 
 ## Future improvements
