@@ -11,7 +11,7 @@
 ![Python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Windows%20(PowerShell)-0078D6)
 ![API version](https://img.shields.io/badge/API%20version-0.1.0-blue)
-![License](https://img.shields.io/badge/license-not%20specified-lightgrey)
+![License](https://img.shields.io/badge/license-MIT-green)
 
 [Overview](#overview) · [Features](#key-features) · [Architecture](#system-architecture) · [Setup](#installation-and-setup) · [API](#api-documentation) · [Testing](#testing-and-validation) · [Security](#security-considerations)
 
