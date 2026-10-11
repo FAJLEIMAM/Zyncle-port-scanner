@@ -377,7 +377,7 @@ cd backend
 .\.venv\Scripts\python.exe -m alembic heads              # read-only, no connection (exactly one head expected)
 .\.venv\Scripts\python.exe -m alembic upgrade head --sql # SQL generation only, no connection, no changes
 .\.venv\Scripts\python.exe -m alembic current            # read-only, connects to the database
-pg_dump -U zyncle_app -h localhost -d zyncle_scanner -F c -f <BACKUP_FILE_OUTSIDE_REPO>   # read-only backup
+pg_dump -U zyncle_app -h localhost -d zyncle_scanner -F c -f "$env:USERPROFILE\zyncle_backup.dump"   # read-only backup
 .\.venv\Scripts\python.exe -m alembic upgrade head       # SCHEMA-CHANGING: applies the migrations
 .\.venv\Scripts\python.exe -m alembic check              # read-only, run after the upgrade
 cd ..
@@ -386,7 +386,7 @@ cd ..
 `pg_dump` and `pg_restore` ship with PostgreSQL and must be on `PATH`. To restore a backup into an empty database (this overwrites objects with the same names, so never point it at a database whose data you want to keep):
  
 ```powershell
-pg_restore -U zyncle_app -h localhost -d zyncle_scanner --no-owner <BACKUP_FILE_OUTSIDE_REPO>
+pg_restore -U zyncle_app -h localhost -d zyncle_scanner --no-owner "$env:USERPROFILE\zyncle_backup.dump"
 ```
  
 - The revision chain is linear (10 revisions at the time of writing; trust `alembic heads` over any ID written here). The last two add `profile` and `vulnerability_profile` to `scans` and backfill existing rows (`common`, `lightweight`).
@@ -489,8 +489,6 @@ Returns `404` (`"Scan not found"`) for an unknown id.
  
 **Scan status values:** `pending` → `running` → `completed` or `failed`. A completed scan with no open ports carries `error_message: "No reachable/open ports discovered."`.
 
-**Scan status values:** `pending` → `running` → `completed` or `failed`. A completed scan with no open ports carries `error_message: "No reachable/open ports discovered."`.
-
 ## Testing and validation
 
 Results are split into what was re-checked while auditing this documentation (2026-10-11, Linux, Python 3.12.3, Node 22.22, no network access) and results reported earlier that were **not** re-run. The audit environment had no PostgreSQL, no Naabu/Nmap/Nuclei and no installed backend dependencies, and the copied `frontend/node_modules` contained only Windows native bindings.
@@ -549,10 +547,9 @@ npm --prefix frontend run lint
 | Scan stays `pending` or `running` | Check the backend logs and scan status. Possible causes include a long-running scanner, a backend restart, or a scan that has not completed. Verify the configured timeout for the relevant scanner. |
 | Scan `failed` | Inspect the scan's error_message and backend logs. Check scanner availability, target authorization, permissions, configuration, and timeout settings. |
 | No findings | An empty result does not necessarily mean the target is secure. Check scanner output, Nmap service/version detection, Nuclei template availability, vulnerability-correlation requirements, and whether optional integrations are enabled. |
-| `NVD_API_KEY` or `NUCLEI_PROCESS_TIMEOUT` has no effect | 
+| NVD_API_KEY or NUCLEI_PROCESS_TIMEOUT has no effect | Verify how the application reads these settings. If they are read directly from the process environment, define them before starting the backend. |
+| npm run build or npm run lint fails with a native-binding error | Dependencies may have been copied from another operating system or architecture. Remove frontend/node_modules and run npm --prefix frontend ci from the repository root. |
 
-Verify how the application loads these settings. If they are read directly from the process environment, define them in that environment before starting the backend. |
-| `npm run build` or `npm run lint` fails with "Permission denied" or a missing native binding | Dependencies may have been copied from another operating system or architecture. Remove frontend/node_modules and run npm --prefix frontend ci on the machine where the frontend will run. |
 
 ## Security considerations
 
