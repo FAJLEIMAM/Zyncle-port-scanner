@@ -543,9 +543,8 @@ npm --prefix frontend run lint
 | `database_url Field required` | `Check whether DATABASE_URL is defined and whether the backend loads the expected environment file. Verify the configuration in the backend settings before changing database credentials.`. |
 | `relation "scans" does not exist` | The database schema may not have been initialized. Confirm that DATABASE_URL points to the intended database, then inspect the Alembic migration status and apply pending migrations if appropriate. |
 | Connection or authentication errors | Verify that PostgreSQL is running, the database exists, the configured credentials are correct, and the database accepts connections at the configured host and port. |
-| `start.ps1` reports a missing virtual environment or dependencies | Repeat [steps 2 and 3](#2-backend-dependencies). |
-| `start.ps1` is blocked | 
-Review the PowerShell execution-policy message and follow the documented startup instructions. Do not change the system-wide execution policy unnecessarily. |
+| `start.ps1` reports a missing virtual environment or dependencies | Follow the backend and frontend installation steps above. Confirm that the virtual environment exists and the required packages are installed. [steps 2 and 3](#2-backend-dependencies). |
+| `start.ps1` is blocked | Review the PowerShell execution-policy message and follow the documented startup instructions. Do not change the system-wide execution policy unnecessarily. |
 | Dashboard shows "API unreachable" | Confirm that the backend is running and reachable at the API URL configured by the frontend. Check the browser console and backend logs for connection or CORS errors. |
 | Scan stays `pending` or `running` | Check the backend logs and scan status. Possible causes include a long-running scanner, a backend restart, or a scan that has not completed. Verify the configured timeout for the relevant scanner. |
 | Scan `failed` | Inspect the scan's error_message and backend logs. Check scanner availability, target authorization, permissions, configuration, and timeout settings. |
