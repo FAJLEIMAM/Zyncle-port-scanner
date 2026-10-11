@@ -596,7 +596,9 @@ No formal contribution process has been defined. To propose a change, open an is
 
 ## License
 
-No license file is currently included. Until the author adds one, default copyright applies and others have no permission to use, modify or redistribute the code.
+This project is licensed under the MIT License.
+
+Copyright (c) 2026 Fajle Imam.
 
 ## Author
 
