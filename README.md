@@ -1,8 +1,8 @@
+# Zyncle Port Scanner
 <div align="center">
 
-# Zyncle Port Scanner
+<img src="https://readme-typing-svg.demolab.com?font=Fira+Code&weight=600&size=26&pause=1000&color=00F7FF&center=true&vCenter=true&width=900&lines=Unified+Vulnerability+Scan+Workflow;Port+Discovery+%7C+Service+Fingerprinting;CVE+Correlation+%7C+Risk+Scoring;SOC-Style+Web+Dashboard;Detect.+Analyze.+Protect." />
 
-**Port discovery, service fingerprinting and CVE correlation in one scan workflow, with a SOC-style web dashboard.**
 
 ![Backend](https://img.shields.io/badge/backend-FastAPI-009688?logo=fastapi&logoColor=white)
 ![Frontend](https://img.shields.io/badge/frontend-React%2019%20%2B%20TypeScript-3178C6?logo=react&logoColor=white)
